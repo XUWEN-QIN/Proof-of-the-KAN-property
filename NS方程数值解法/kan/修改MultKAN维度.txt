@@ -1,0 +1,127 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import os
+import random
+
+class MultKAN(nn.Module):
+    def __init__(self, width=None, grid=3, k=3, mult_arity=2, noise_scale=1.0, 
+                 scale_base_mu=0.0, scale_base_sigma=1.0, base_fun='silu', 
+                 symbolic_enabled=True, affine_trainable=False, grid_eps=1.0, 
+                 grid_range=[-1, 1], sp_trainable=True, sb_trainable=True, 
+                 seed=1, save_act=True, sparse_init=False, auto_save=True, 
+                 first_init=True, ckpt_path='./model', state_id=0, round=0):
+        
+        super(MultKAN, self).__init__()
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+
+        self.act_fun = []
+        self.depth = len(width) - 1
+        
+        for i in range(len(width)):
+            if isinstance(width[i], int):
+                width[i] = [width[i], 0]
+
+        self.width = width
+        
+        self.mult_homo = isinstance(mult_arity, int)
+        self.mult_arity = mult_arity
+
+        self.grid_eps = grid_eps
+        self.grid_range = grid_range
+        
+        for l in range(self.depth):
+            scale_base = scale_base_mu * 1 / np.sqrt(self.width[l]) + \
+                         scale_base_sigma * (torch.randn(self.width[l], self.width[l + 1]) * 2 - 1) * 1/np.sqrt(self.width[l])
+            sp_batch = KANLayer(in_dim=self.width[l], out_dim=self.width[l + 1], num=grid, k=k, 
+                                noise_scale=noise_scale, scale_base=scale_base, scale_sp=1., 
+                                base_fun=base_fun, grid_eps=grid_eps, grid_range=grid_range, 
+                                sp_trainable=sp_trainable, sb_trainable=sb_trainable, 
+                                sparse_init=sparse_init)
+            self.act_fun.append(sp_batch)
+
+        self.node_bias = []
+        self.node_scale = []
+        self.subnode_bias = []
+        self.subnode_scale = []
+        
+        self.node_bias_0 = nn.Parameter(torch.zeros(3, 1), requires_grad=False)
+
+        for l in range(self.depth):
+            self.node_bias.append(nn.Parameter(torch.zeros(self.width[l + 1]).requires_grad_(affine_trainable)))
+            self.node_scale.append(nn.Parameter(torch.ones(self.width[l + 1]).requires_grad_(affine_trainable)))
+            self.subnode_bias.append(nn.Parameter(torch.zeros(self.width[l + 1]).requires_grad_(affine_trainable)))
+            self.subnode_scale.append(nn.Parameter(torch.ones(self.width[l + 1]).requires_grad_(affine_trainable)))
+
+        self.act_fun = nn.ModuleList(self.act_fun)
+        
+        self.symbolic_fun = []
+        for l in range(self.depth):
+            sb_batch = Symbolic_KANLayer(in_dim=self.width[l], out_dim=self.width[l + 1])
+            self.symbolic_fun.append(sb_batch)
+
+        self.symbolic_fun = nn.ModuleList(self.symbolic_fun)
+        self.symbolic_enabled = symbolic_enabled
+        
+        self.save_act = save_act
+        self.node_scores = None
+        self.edge_scores = None
+        self.subnode_scores = None
+        
+        self.cache_data = None
+        self.acts = None
+        self.auto_save = auto_save
+        self.state_id = state_id
+        self.ckpt_path = ckpt_path
+        self.round = round
+
+        if auto_save and first_init:
+            if not os.path.exists(ckpt_path):
+                os.makedirs(ckpt_path)
+                print(f"checkpoint directory created: {ckpt_path}")
+                print('saving model version 0.0')
+                history_path = os.path.join(ckpt_path, 'history.txt')
+                with open(history_path, 'w') as file:
+                    file.write(f'### Round {self.round} ###' + '\n')
+                    file.write('init => 0.0' + '\n')
+                self.saveckpt(path=os.path.join(self.ckpt_path, '0.0'))
+
+        if self.width[0] == 2:
+            self.input_id = torch.tensor([0, 1])
+        else:
+            self.input_id = torch.arange(self.width[0])
+
+    def forward(self, x):
+        # 实现前向传播逻辑，确保输出维度为 [batch_size, 2]
+        for l in range(self.depth):
+            x = self.act_fun[l](x)
+        return x  # 确保最后的返回维度为 [batch_size, 2]
+
+    def initialize_from_another_model(self, another_model, x):
+        another_model(x)  # get activations
+        batch = x.shape[0]
+
+        self.initialize_grid_from_another_model(another_model, x)
+
+        for l in range(self.depth):
+            spb = self.act_fun[l]
+            preacts = another_model.spline_preacts[l]
+            postsplines = another_model.spline_postsplines[l]
+            self.act_fun[l].scale_base.data = another_model.act_fun[l].scale_base.data
+            self.act_fun[l].scale_sp.data = another_model.act_fun[l].scale_sp.data
+            self.act_fun[l].mask.data = another_model.act_fun[l].mask.data
+
+        for l in range(self.depth):
+            self.node_bias[l].data = another_model.node_bias[l].data
+            self.node_scale[l].data = another_model.node_scale[l].data
+            self.subnode_bias[l].data = another_model.subnode_bias[l].data
+            self.subnode_scale[l].data = another_model.subnode_scale[l].data
+
+        for l in range(self.depth):
+            self.symbolic_fun[l] = another_model.symbolic_fun[l]
+
+        return self
